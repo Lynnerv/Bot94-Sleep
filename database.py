@@ -123,3 +123,82 @@ def delete_schedule(schedule_id, user_id):
     connection.close()
 
     return deleted
+
+
+# ============================================================
+# NUEVAS FUNCIONES PARA EL GUI
+# ============================================================
+
+def update_schedule(
+    schedule_id,
+    user_id,
+    time,
+    days,
+    mute,
+    deafen,
+    disconnect,
+    confirmation
+):
+    """
+    Actualiza un horario existente.
+    Solo permite modificar horarios pertenecientes al usuario.
+    """
+
+    connection = get_connection()
+
+    cursor = connection.execute("""
+        UPDATE schedules
+        SET
+            time = ?,
+            days = ?,
+            mute = ?,
+            deafen = ?,
+            disconnect = ?,
+            confirmation = ?
+        WHERE id = ?
+        AND user_id = ?
+    """, (
+        time,
+        days,
+        int(mute),
+        int(deafen),
+        int(disconnect),
+        int(confirmation),
+        schedule_id,
+        user_id
+    ))
+
+    connection.commit()
+
+    updated = cursor.rowcount > 0
+
+    connection.close()
+
+    return updated
+
+
+def set_schedule_enabled(schedule_id, user_id, enabled):
+    """
+    Activa o desactiva un horario.
+    """
+
+    connection = get_connection()
+
+    cursor = connection.execute("""
+        UPDATE schedules
+        SET enabled = ?
+        WHERE id = ?
+        AND user_id = ?
+    """, (
+        int(enabled),
+        schedule_id,
+        user_id
+    ))
+
+    connection.commit()
+
+    updated = cursor.rowcount > 0
+
+    connection.close()
+
+    return updated
