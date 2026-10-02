@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
@@ -79,7 +79,6 @@ class Scheduler:
 
             await self.process_schedule(schedule)
 
-            # Evitar que el conjunto crezca indefinidamente
             if len(self.executed) > 1000:
                 self.executed.clear()
 
@@ -145,9 +144,6 @@ class Scheduler:
                     f"No se pudo enviar DM a {member}."
                 )
 
-                # Si los DMs están cerrados, no ejecutamos
-                # automáticamente cuando se requiere confirmación.
-
             return
 
         await execute_actions(
@@ -173,13 +169,17 @@ async def execute_actions(
 
         return False
 
+    # 🎧 DEAFEN SIEMPRE IMPLICA MUTE
+    if deafen:
+        mute = True
+
     try:
 
         if mute or deafen:
 
             await member.edit(
-                mute=True if mute else None,
-                deafen=True if deafen else None
+                mute=mute,
+                deafen=deafen
             )
 
             logger.info(
