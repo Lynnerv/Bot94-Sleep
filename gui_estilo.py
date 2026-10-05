@@ -1,7 +1,7 @@
 import sys
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import Qt, QTime
+from PySide6.QtCore import Qt, QTime, QEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,6 +38,128 @@ from database import (
 APP_TITLE = "Bot94 Sleep"
 TIMEZONE_TEXT = "America/Lima"
 
+class FlexibleTimeEdit(QTimeEdit):
+    """
+    Campo de hora 24h:
+    - Se puede seleccionar/borrar todo.
+    - 8   -> 08:00
+    - 839 -> 08:39
+    - 2230 -> 22:30
+    - Sin flechas visibles.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._input_buffer = ""
+        self.setDisplayFormat("HH:mm")
+        self.setKeyboardTracking(False)
+        self.lineEdit().setReadOnly(False)
+        self.lineEdit().setAlignment(Qt.AlignCenter)
+
+    def _commit_buffer(self):
+        if not self._input_buffer:
+            return True
+
+        raw = self._input_buffer
+
+        try:
+            if len(raw) <= 2:
+                hour = int(raw)
+                minute = 0
+            elif len(raw) == 3:
+                hour = int(raw[0])
+                minute = int(raw[1:])
+            elif len(raw) == 4:
+                hour = int(raw[:2])
+                minute = int(raw[2:])
+            else:
+                return False
+
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                self.setTime(QTime(hour, minute))
+                self._input_buffer = ""
+                return True
+        except ValueError:
+            pass
+
+        return False
+
+    def _clear_input(self):
+        self._input_buffer = ""
+        self.lineEdit().clear()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._input_buffer = ""
+        self.lineEdit().selectAll()
+
+    def focusOutEvent(self, event):
+        if self._input_buffer:
+            self._commit_buffer()
+        else:
+            # Si el usuario borró todo, mantenemos la última hora válida
+            # para que el control nunca quede en un estado inválido.
+            if not self.lineEdit().text().strip():
+                self.lineEdit().setText(self.time().toString("HH:mm"))
+
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        # Dígitos: acumular sin auto-rellenar cada pulsación.
+        if Qt.Key_0 <= key <= Qt.Key_9:
+            digit = event.text()
+            if digit:
+                self._input_buffer += digit
+
+                # 3 dígitos = HMM (ej. 839 -> 08:39)
+                # 4 dígitos = HHMM (ej. 2230 -> 22:30)
+                if len(self._input_buffer) in (3, 4):
+                    if self._commit_buffer():
+                        return
+
+                # Mientras se escribe, mostrar exactamente lo introducido.
+                self.lineEdit().setText(self._input_buffer)
+                self.lineEdit().setCursorPosition(len(self._input_buffer))
+                return
+
+        # Backspace/Delete permiten borrar todo.
+        if key in (Qt.Key_Backspace, Qt.Key_Delete):
+            if self._input_buffer:
+                self._input_buffer = self._input_buffer[:-1]
+                self.lineEdit().setText(self._input_buffer)
+            else:
+                self._clear_input()
+            return
+
+        # Enter confirma la hora escrita.
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            if self._input_buffer:
+                self._commit_buffer()
+            return
+
+        # Flechas izquierda/derecha normales.
+        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End):
+            super().keyPressEvent(event)
+            return
+
+        # Arriba/abajo: +/- 1 minuto.
+        if key in (Qt.Key_Up, Qt.Key_Down):
+            if self._input_buffer:
+                self._commit_buffer()
+            self.stepBy(1 if key == Qt.Key_Up else -1)
+            return
+
+        super().keyPressEvent(event)
+
+    def stepBy(self, steps):
+        # Las flechas y los botones de flecha del QTimeEdit usan esto.
+        if self._input_buffer:
+            self._commit_buffer()
+
+        self.setTime(self.time().addSecs(steps * 60))
+
+
 DAY_NAMES = [
     ("L", "lunes"),
     ("M", "martes"),
@@ -49,25 +171,18 @@ DAY_NAMES = [
 ]
 
 
-def normalize_actions(mute, unmute, deafen, disconnect):
+def normalize_actions(mute, deafen, disconnect):
     # Deafen always implies Mute.
     if deafen:
         mute = True
 
-    # Unmute removes both server mute and server deafen.
-    if unmute:
-        mute = False
-        deafen = False
-
-    return mute, unmute, deafen, disconnect
+    return mute, deafen, disconnect
 
 
 def actions_text(row):
     actions = []
     if row["mute"]:
         actions.append("🔇 Mute")
-    if row["unmute"]:
-        actions.append("🔊 Unmute")
     if row["deafen"]:
         actions.append("🎧 Deafen")
     if row["disconnect"]:
@@ -132,10 +247,10 @@ class ScheduleDialog(QDialog):
         time_layout.addLayout(time_text)
         time_layout.addStretch()
 
-        self.time_edit = QTimeEdit()
+        self.time_edit = FlexibleTimeEdit()
         self.time_edit.setObjectName("ScheduleTime")
-        self.time_edit.setDisplayFormat("HH:mm")
         self.time_edit.setTime(QTime.currentTime())
+        self.time_edit.setButtonSymbols(QTimeEdit.ButtonSymbols.NoButtons)
         time_layout.addWidget(self.time_edit)
 
         layout.addWidget(time_card)
@@ -183,14 +298,12 @@ class ScheduleDialog(QDialog):
         actions_layout.setVerticalSpacing(10)
 
         self.mute_check = QCheckBox("🔇   Mute")
-        self.unmute_check = QCheckBox("🔊   Unmute")
         self.deafen_check = QCheckBox("🎧   Deafen")
         self.disconnect_check = QCheckBox("🚪   Disconnect")
         self.confirmation_check = QCheckBox("◉   Pedir confirmación")
 
         for check in (
             self.mute_check,
-            self.unmute_check,
             self.deafen_check,
             self.disconnect_check,
             self.confirmation_check,
@@ -199,18 +312,16 @@ class ScheduleDialog(QDialog):
             check.setMinimumHeight(46)
 
         self.deafen_check.toggled.connect(self.on_deafen_changed)
-        self.unmute_check.toggled.connect(self.on_unmute_changed)
 
         actions_layout.addWidget(self.mute_check, 0, 0)
-        actions_layout.addWidget(self.unmute_check, 0, 1)
-        actions_layout.addWidget(self.deafen_check, 1, 0)
-        actions_layout.addWidget(self.disconnect_check, 1, 1)
+        actions_layout.addWidget(self.deafen_check, 0, 1)
+        actions_layout.addWidget(self.disconnect_check, 1, 0)
         actions_layout.addWidget(self.confirmation_check, 2, 0, 1, 2)
 
         layout.addLayout(actions_layout)
 
         info = QLabel(
-            "ℹ  Deafen incluye Mute.  •  Unmute quita Mute + Deafen."
+            "ℹ  Deafen incluye Mute."
         )
         info.setObjectName("DialogInfo")
         info.setAlignment(Qt.AlignCenter)
@@ -244,12 +355,6 @@ class ScheduleDialog(QDialog):
     def on_deafen_changed(self, checked):
         if checked:
             self.mute_check.setChecked(True)
-            self.unmute_check.setChecked(False)
-
-    def on_unmute_changed(self, checked):
-        if checked:
-            self.mute_check.setChecked(False)
-            self.deafen_check.setChecked(False)
 
     def load_schedule(self, row):
         hour, minute = map(int, row["time"].split(":"))
@@ -265,43 +370,9 @@ class ScheduleDialog(QDialog):
             check.setChecked(full in saved_days)
 
         self.mute_check.setChecked(bool(row["mute"]))
-        self.unmute_check.setChecked(bool(row["unmute"]))
         self.deafen_check.setChecked(bool(row["deafen"]))
         self.disconnect_check.setChecked(bool(row["disconnect"]))
         self.confirmation_check.setChecked(bool(row["confirmation"]))
-
-    def normalize_time_input(self):
-        """Permite borrar y escribir la hora libremente; normaliza al terminar."""
-        raw = self.time_edit.text().strip()
-
-        if not raw:
-            return
-
-        # Acepta: 8 -> 08:00, 830 -> 08:30, 08 -> 08:00, 08:30 -> 08:30
-        if raw.isdigit():
-            if len(raw) <= 2:
-                hour = int(raw)
-                minute = 0
-            elif len(raw) == 3:
-                hour = int(raw[0])
-                minute = int(raw[1:])
-            elif len(raw) == 4:
-                hour = int(raw[:2])
-                minute = int(raw[2:])
-            else:
-                self.time_edit.setFocus()
-                return
-
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                self.time_edit.setText(f"{hour:02d}:{minute:02d}")
-            return
-
-        match = re.fullmatch(r"(\\d{1,2}):(\\d{1,2})", raw)
-        if match:
-            hour = int(match.group(1))
-            minute = int(match.group(2))
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                self.time_edit.setText(f"{hour:02d}:{minute:02d}")
 
     def get_values(self):
         selected_days = [
@@ -310,19 +381,17 @@ class ScheduleDialog(QDialog):
         ]
 
         mute = self.mute_check.isChecked()
-        unmute = self.unmute_check.isChecked()
         deafen = self.deafen_check.isChecked()
         disconnect = self.disconnect_check.isChecked()
 
-        mute, unmute, deafen, disconnect = normalize_actions(
-            mute, unmute, deafen, disconnect
+        mute, deafen, disconnect = normalize_actions(
+            mute, deafen, disconnect
         )
 
         return {
             "time": self.time_edit.time().toString("HH:mm"),
             "days": ",".join(selected_days),
             "mute": mute,
-            "unmute": unmute,
             "deafen": deafen,
             "disconnect": disconnect,
             "confirmation": self.confirmation_check.isChecked(),
@@ -342,7 +411,6 @@ class ScheduleDialog(QDialog):
         if not any(
             [
                 values["mute"],
-                values["unmute"],
                 values["deafen"],
                 values["disconnect"],
             ]
@@ -592,7 +660,7 @@ class MainWindow(QMainWindow):
                 font-size: 10px;
             }
 
-            QLineEdit#ScheduleTime {
+            QTimeEdit#ScheduleTime {
                 background: #071426;
                 color: #e8f4ff;
                 border: 1px solid #00bfa0;
@@ -741,7 +809,7 @@ class MainWindow(QMainWindow):
                 font-size: 10px;
             }
 
-            QLineEdit#ScheduleTime {
+            QTimeEdit#ScheduleTime {
                 background: #071426;
                 color: #e8f4ff;
                 border: 1px solid #00bfa0;
@@ -917,7 +985,7 @@ class MainWindow(QMainWindow):
 
         side_layout.addStretch()
 
-        version = QLabel("BOT94 SLEEP  •  v1.1")
+        version = QLabel("BOT94 SLEEP  •  v1.1.4")
         version.setStyleSheet("color: #888; padding: 8px;")
         side_layout.addWidget(version)
 
@@ -1049,68 +1117,165 @@ class MainWindow(QMainWindow):
     def build_sleep_page(self):
         page, layout = self.page_container(
             "Sleep",
-            "Prepara una acción de sueño para tu sesión de Discord."
+            "Prepara un temporizador de una sola ejecución."
         )
 
         card = QFrame()
         card.setObjectName("Card")
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(22, 22, 22, 22)
+        card_layout.setSpacing(12)
 
-        label = QLabel("Dormir después de:")
-        label.setStyleSheet("font-weight: 600;")
+        label = QLabel("Tiempo del Sleep")
+        label.setStyleSheet("font-weight: 700; font-size: 15px;")
+        card_layout.addWidget(label)
 
         self.sleep_minutes = QSpinBox()
         self.sleep_minutes.setRange(1, 1440)
-        self.sleep_minutes.setValue(30)
-        self.sleep_minutes.setSuffix(" minutos")
+        self.sleep_minutes.setValue(15)
+        self.sleep_minutes.setSuffix(" min")
+        self.sleep_minutes.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.sleep_minutes.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sleep_minutes.setMinimumHeight(42)
+        card_layout.addWidget(self.sleep_minutes)
+
+        self.sleep_time_label = QLabel("⏰ 15 min")
+        self.sleep_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sleep_time_label.setStyleSheet(
+            "color: #00d4a0; font-size: 18px; font-weight: 700;"
+        )
+        card_layout.addWidget(self.sleep_time_label)
+
+        presets = QGridLayout()
+        presets.setHorizontalSpacing(8)
+        presets.setVerticalSpacing(8)
+
+        preset_values = [
+            ("15 min", 15),
+            ("30 min", 30),
+            ("45 min", 45),
+            ("1 hora", 60),
+            ("1h 15m", 75),
+            ("1h 30m", 90),
+        ]
+
+        for index, (label_text, value) in enumerate(preset_values):
+            button = QPushButton(label_text)
+            button.setObjectName("Secondary")
+            button.setMinimumHeight(38)
+            button.clicked.connect(
+                lambda checked=False, v=value: self.set_sleep_minutes(v)
+            )
+            presets.addWidget(button, index // 3, index % 3)
+
+        card_layout.addLayout(presets)
+
+        adjust = QHBoxLayout()
+        adjust.setSpacing(8)
+
+        minus_button = QPushButton("➖ 15 min")
+        minus_button.setObjectName("Secondary")
+        minus_button.clicked.connect(
+            lambda: self.adjust_sleep_minutes(-15)
+        )
+
+        custom_button = QPushButton("✏️ Personalizado")
+        custom_button.setObjectName("Secondary")
+        custom_button.clicked.connect(self.focus_sleep_minutes)
+
+        plus_button = QPushButton("➕ 15 min")
+        plus_button.setObjectName("Secondary")
+        plus_button.clicked.connect(
+            lambda: self.adjust_sleep_minutes(15)
+        )
+
+        adjust.addWidget(minus_button)
+        adjust.addWidget(custom_button)
+        adjust.addWidget(plus_button)
+        card_layout.addLayout(adjust)
+
+        card_layout.addSpacing(8)
+
+        actions_label = QLabel("Acciones")
+        actions_label.setStyleSheet("font-weight: 700;")
+        card_layout.addWidget(actions_label)
 
         self.sleep_mute = QCheckBox("🔇 Mute")
         self.sleep_deafen = QCheckBox("🎧 Deafen")
         self.sleep_disconnect = QCheckBox("🚪 Disconnect")
-        self.sleep_confirmation = QCheckBox("Pedir confirmación")
+        self.sleep_confirmation = QCheckBox("◉ Pedir confirmación")
+        self.sleep_confirmation.setChecked(True)
 
         self.sleep_deafen.toggled.connect(
             lambda checked: self.sleep_mute.setChecked(True)
             if checked else None
         )
 
-        card_layout.addWidget(label)
-        card_layout.addWidget(self.sleep_minutes)
-        card_layout.addSpacing(10)
         card_layout.addWidget(self.sleep_mute)
         card_layout.addWidget(self.sleep_deafen)
         card_layout.addWidget(self.sleep_disconnect)
         card_layout.addWidget(self.sleep_confirmation)
 
         info = QLabel(
-            "La configuración del temporizador está preparada en el GUI. "
-            "La ejecución directa desde el GUI se conectará al bot en el "
-            "siguiente paso; por ahora /sleep en Discord sigue siendo la "
-            "forma de ejecutar el temporizador."
+            "Los tiempos rápidos solo preparan la configuración del Sleep. "
+            "La ejecución del temporizador desde la GUI se conectará al bot "
+            "cuando integremos la comunicación GUI ↔ bot. Por ahora, "
+            "puedes ejecutar /sleep directamente desde Discord."
         )
         info.setWordWrap(True)
-        info.setStyleSheet("color: #666;")
+        info.setStyleSheet("color: #6e9cc4;")
         card_layout.addWidget(info)
 
-        button = QPushButton("Iniciar Sleep")
+        button = QPushButton("🌙 Iniciar Sleep")
         button.setObjectName("Primary")
         button.clicked.connect(self.sleep_not_ready)
-        card_layout.addWidget(button, alignment=Qt.AlignmentFlag.AlignLeft)
+        card_layout.addWidget(
+            button,
+            alignment=Qt.AlignmentFlag.AlignLeft,
+        )
+
+        self.sleep_minutes.valueChanged.connect(
+            self.update_sleep_time_label
+        )
 
         layout.addWidget(card)
         layout.addStretch()
 
         return page
 
+    def update_sleep_time_label(self, value):
+        hours, minutes = divmod(int(value), 60)
+
+        if hours == 0:
+            text = f"{value} min"
+        elif minutes == 0:
+            text = f"{hours} h"
+        else:
+            text = f"{hours} h {minutes} min"
+
+        self.sleep_time_label.setText(f"⏰ {text}")
+
+    def set_sleep_minutes(self, value):
+        self.sleep_minutes.setValue(
+            max(1, min(1440, int(value)))
+        )
+
+    def adjust_sleep_minutes(self, delta):
+        self.set_sleep_minutes(
+            self.sleep_minutes.value() + delta
+        )
+
+    def focus_sleep_minutes(self):
+        self.sleep_minutes.setFocus()
+        self.sleep_minutes.selectAll()
+
     def sleep_not_ready(self):
         QMessageBox.information(
             self,
             "Sleep",
-            "La configuración está lista, pero la ejecución del "
-            "temporizador desde el GUI la conectaremos al bot en el "
-            "siguiente paso.\n\n"
-            "Mientras tanto puedes usar /sleep desde Discord."
+            "La configuración del Sleep está lista.\n\n"
+            "La ejecución directa desde la GUI todavía no está conectada "
+            "al bot. Mientras tanto, usa /sleep desde Discord."
         )
 
     def build_schedules_page(self):
@@ -1373,7 +1538,6 @@ class MainWindow(QMainWindow):
                 values["time"],
                 values["days"],
                 values["mute"],
-                values["unmute"],
                 values["deafen"],
                 values["disconnect"],
                 values["confirmation"],
@@ -1417,7 +1581,6 @@ class MainWindow(QMainWindow):
                 values["time"],
                 values["days"],
                 values["mute"],
-                values["unmute"],
                 values["deafen"],
                 values["disconnect"],
                 values["confirmation"],
