@@ -1,24 +1,36 @@
 import asyncio
+import json
 import logging
-from datetime import date, datetime, time as dt_time, timedelta
-from zoneinfo import ZoneInfo
+
+from datetime import (
+    datetime,
+    timedelta,
+    time as dtime
+)
 
 import discord
 
-from database import (
-    create_execution,
-    get_execution,
-    get_pending_executions,
-    get_schedules,
-    update_execution,
+from config import (
+    TIMEZONE,
+    CHECK_SECONDS,
+    SCHEDULE_REMINDER_HOURS
 )
 
-logger = logging.getLogger("Bot94Sleep.Scheduler")
+from database import (
+    get_schedules,
+    get_execution,
+    create_execution,
+    update_execution,
+    get_enabled_sleep_checks,
+    update_sleep_check,
+    upsert_voice_effect
+)
 
-TIMEZONE = ZoneInfo("America/Lima")
-REMINDER_HOURS = 2
-REMINDER_MINUTES = 2
-CHECK_SECONDS = 15
+
+log = logging.getLogger(
+    "Bot94Sleep.Scheduler"
+)
+
 
 DAY_NAMES = {
     0: "lunes",
@@ -27,280 +39,553 @@ DAY_NAMES = {
     3: "jueves",
     4: "viernes",
     5: "sabado",
-    6: "domingo",
+    6: "domingo"
 }
 
 
-def normalize_actions(mute=False, deafen=False, disconnect=False):
+def normalize_actions(
+    mute,
+    deafen,
+    disconnect
+):
+
     if deafen:
+
         mute = True
-    return bool(mute), bool(deafen), bool(disconnect)
 
-
-async def execute_actions(member, mute=False, deafen=False, disconnect=False):
-    if member is None or member.voice is None or member.voice.channel is None:
-        return False
-
-    mute, deafen, disconnect = normalize_actions(
-        mute, deafen, disconnect
+    return (
+        bool(mute),
+        bool(deafen),
+        bool(disconnect)
     )
 
+
+async def execute_actions(
+    member,
+    mute=False,
+    deafen=False,
+    disconnect=False
+):
+
+    mute, deafen, disconnect = normalize_actions(
+        mute,
+        deafen,
+        disconnect
+    )
+
+    if (
+        not member.voice
+        or not member.voice.channel
+    ):
+
+        return False
+
     try:
+
         if mute or deafen:
-            await member.edit(mute=mute, deafen=deafen)
+
+            await member.edit(
+                mute=mute,
+                deafen=deafen
+            )
+
+            upsert_voice_effect(
+                member.id,
+                member.guild.id,
+                mute_by_bot=mute,
+                deafen_by_bot=deafen
+            )
 
         if disconnect:
+
             await member.move_to(None)
 
         return True
 
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.error(
-            "No se pudieron ejecutar acciones sobre %s: %s",
-            member,
-            exc,
+    except (
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+
+        log.exception(
+            "Discord rechazó una acción sobre %s",
+            member.id
         )
+
         return False
+
+
+def _days(value):
+
+    try:
+
+        return [
+            str(x).lower().strip()
+            for x in json.loads(value)
+        ]
+
     except Exception:
-        logger.exception(
-            "Error inesperado ejecutando acciones sobre %s",
-            member,
+
+        return []
+
+
+def _time(value):
+
+    try:
+
+        hours, minutes = map(
+            int,
+            value.split(":")
         )
-        return False
+
+        return dtime(
+            hours,
+            minutes
+        )
+
+    except Exception:
+
+        return None
 
 
-def parse_schedule_days(value):
-    return {
-        part.strip().lower()
-        for part in value.split(",")
-        if part.strip()
-    }
+def next_occurrence(
+    row,
+    now
+):
 
-
-def build_candidate(now, day_name, time_text):
-    hour, minute = map(int, time_text.split(":"))
-    weekday = list(DAY_NAMES.values()).index(day_name)
-    delta = (weekday - now.weekday()) % 7
-    target_date = now.date() + timedelta(days=delta)
-    candidate = datetime.combine(
-        target_date,
-        dt_time(hour, minute),
-        tzinfo=TIMEZONE,
+    schedule_time = _time(
+        row["time"]
     )
 
-    if candidate <= now:
-        candidate += timedelta(days=7)
+    wanted_days = set(
+        _days(row["days"])
+    )
 
-    return candidate
+    if (
+        not schedule_time
+        or not wanted_days
+    ):
 
+        return None
 
-def next_occurrence(now, schedule):
-    candidates = []
+    for offset in range(8):
 
-    for day_name in parse_schedule_days(schedule["days"]):
-        if day_name not in DAY_NAMES.values():
+        date = (
+            now
+            +
+            timedelta(days=offset)
+        ).date()
+
+        if (
+            DAY_NAMES[date.weekday()]
+            not in wanted_days
+        ):
+
             continue
-        candidates.append(
-            build_candidate(now, day_name, schedule["time"])
+
+        occurrence = datetime.combine(
+            date,
+            schedule_time,
+            tzinfo=TIMEZONE
         )
 
-    return min(candidates) if candidates else None
+        if occurrence > now:
+
+            return occurrence
+
+    return None
 
 
-def execution_datetime(execution):
-    if execution["override_datetime"]:
-        return datetime.fromisoformat(execution["override_datetime"])
+async def find_member(
+    bot,
+    user_id,
+    guild_id
+):
 
-    return datetime.combine(
-        date.fromisoformat(execution["execution_date"]),
-        dt_time(*map(int, execution["original_time"].split(":"))),
-        tzinfo=TIMEZONE,
+    guild = bot.get_guild(
+        int(guild_id)
     )
+
+    if not guild:
+
+        return None
+
+    member = guild.get_member(
+        int(user_id)
+    )
+
+    if member:
+
+        return member
+
+    try:
+
+        return await guild.fetch_member(
+            int(user_id)
+        )
+
+    except Exception:
+
+        return None
 
 
 class Scheduler:
+
     def __init__(self, bot):
+
         self.bot = bot
         self.running = True
 
     async def start(self):
-        logger.info("Scheduler iniciado.")
+
+        log.info(
+            "Scheduler iniciado"
+        )
 
         while self.running:
-            try:
-                await self.check_schedules()
-            except Exception:
-                logger.exception("Error revisando horarios.")
 
-            await asyncio.sleep(CHECK_SECONDS)
+            try:
+
+                await self.check_schedules()
+
+                await self.check_sleep_checks()
+
+            except Exception:
+
+                log.exception(
+                    "Error del scheduler"
+                )
+
+            await asyncio.sleep(
+                CHECK_SECONDS
+            )
 
     async def check_schedules(self):
-        now = datetime.now(TIMEZONE)
-        schedules = get_schedules()
 
-        # Creamos la ejecución cuando entra en la ventana de 2 horas.
-        # Así, si el bot arranca después del recordatorio pero antes de
-        # la hora de ejecución, todavía puede ejecutar correctamente.
-        for schedule in schedules:
-            occurrence = next_occurrence(now, schedule)
+        now = datetime.now(
+            TIMEZONE
+        )
 
-            if occurrence is None:
+        for row in get_schedules(
+            enabled_only=True
+        ):
+
+            occurrence = next_occurrence(
+                row,
+                now
+            )
+
+            if not occurrence:
+
                 continue
 
-            if occurrence - now > timedelta(hours=REMINDER_HOURS):
-                continue
+            execution_date = (
+                occurrence
+                .date()
+                .isoformat()
+            )
 
-            if now > occurrence:
-                continue
-
-            execution_date = occurrence.date().isoformat()
             execution = get_execution(
-                schedule["id"],
-                execution_date,
+                row["id"],
+                execution_date
             )
 
             if execution is None:
-                execution = create_execution(
-                    schedule["id"],
-                    execution_date,
-                    schedule["time"],
-                    now.isoformat(),
+
+                if (
+                    occurrence - now
+                    <= timedelta(
+                        hours=
+                        SCHEDULE_REMINDER_HOURS
+                    )
+                ):
+
+                    execution = create_execution(
+                        row["id"],
+                        execution_date,
+                        occurrence.isoformat()
+                    )
+
+                else:
+
+                    continue
+
+            if execution["status"] in {
+                "executed",
+                "skipped",
+                "failed",
+                "cancelled"
+            }:
+
+                continue
+
+            target = datetime.fromisoformat(
+                execution[
+                    "override_datetime"
+                ]
+                or execution[
+                    "original_datetime"
+                ]
+            )
+
+            reminder_time = (
+                target
+                -
+                timedelta(
+                    hours=
+                    SCHEDULE_REMINDER_HOURS
                 )
+            )
 
             if (
-                schedule["confirmation"]
+                bool(row["confirmation"])
                 and not execution["reminder_sent"]
+                and reminder_time <= now < target
             ):
-                reminder_at = (
-                    occurrence - timedelta(hours=REMINDER_HOURS)
+
+                await self.send_reminder(
+                    row,
+                    execution,
+                    target
+                )
+
+                update_execution(
+                    execution["id"],
+                    reminder_sent=1,
+                    status="waiting"
+                )
+
+                continue
+
+            if now >= target:
+
+                member = await find_member(
+                    self.bot,
+                    row["user_id"],
+                    row["guild_id"]
                 )
 
                 if (
-                    reminder_at
-                    <= now
-                    < reminder_at + timedelta(minutes=REMINDER_MINUTES)
+                    not member
+                    or not member.voice
                 ):
-                    await self.send_reminder(
-                        schedule,
-                        execution,
-                        occurrence,
+
+                    result = "skipped"
+
+                else:
+
+                    success = await execute_actions(
+                        member,
+                        bool(row["mute"]),
+                        bool(row["deafen"]),
+                        bool(row["disconnect"])
                     )
 
-                    update_execution(
-                        execution["id"],
-                        reminder_sent=1,
-                        updated_at=now.isoformat(),
+                    result = (
+                        "executed"
+                        if success
+                        else "failed"
                     )
 
-        # Ejecutar las ejecuciones pendientes cuya hora efectiva ya llegó.
-        for execution in get_pending_executions():
-            effective_dt = execution_datetime(execution)
-
-            if effective_dt <= now:
-                await self.execute_scheduled(execution)
+                update_execution(
+                    execution["id"],
+                    status=result,
+                    confirmed=int(
+                        result == "executed"
+                    )
+                )
 
     async def send_reminder(
         self,
-        schedule,
+        row,
         execution,
-        occurrence,
+        target
     ):
-        guild = self.bot.get_guild(schedule["guild_id"])
 
-        if guild is None:
+        member = await find_member(
+            self.bot,
+            row["user_id"],
+            row["guild_id"]
+        )
+
+        if not member:
+
             return
 
-        member = guild.get_member(schedule["user_id"])
+        from apibot import ScheduleReminderView
 
-        if member is None:
-            return
+        try:
 
-        from bot import ScheduleReminderView
+            await member.send(
+                (
+                    "⏰ **Bot94 Sleep**\n\n"
+                    f"Tu desconexión está programada "
+                    f"para las **{target:%H:%M}**.\n\n"
+                    "Puedes modificar solamente esta "
+                    "ejecución."
+                ),
+                view=ScheduleReminderView(
+                    self.bot,
+                    row,
+                    execution["id"],
+                    target
+                )
+            )
 
-        text = (
-            "🌙 **Bot94 Sleep — Recordatorio**\n\n"
-            f"⏰ Tienes un Sleep programado para "
-            f"**{occurrence.strftime('%H:%M')}**.\n\n"
-            f"{format_actions(schedule)}\n\n"
-            "Este aviso dura 2 minutos. Si no respondes, "
-            "el horario seguirá normalmente."
+        except discord.Forbidden:
+
+            log.warning(
+                "No pude enviar DM a %s",
+                member.id
+            )
+
+    async def check_sleep_checks(self):
+
+        now = datetime.now(
+            TIMEZONE
+        )
+
+        for row in get_enabled_sleep_checks():
+
+            member = await find_member(
+                self.bot,
+                row["user_id"],
+                row["guild_id"]
+            )
+
+            if (
+                not member
+                or not member.voice
+            ):
+
+                continue
+
+            waiting = None
+
+            if row["waiting_until"]:
+
+                waiting = datetime.fromisoformat(
+                    row["waiting_until"]
+                )
+
+            if (
+                waiting
+                and now >= waiting
+            ):
+
+                success = await execute_actions(
+                    member,
+                    mute=True
+                )
+
+                if success:
+
+                    update_sleep_check(
+                        member.id,
+                        member.guild.id,
+                        waiting_until=None,
+                        muted_by_sleep_check=1,
+                        next_check_at=(
+                            now
+                            +
+                            timedelta(
+                                minutes=
+                                row[
+                                    "interval_minutes"
+                                ]
+                            )
+                        ).isoformat(
+                            timespec="seconds"
+                        )
+                    )
+
+                continue
+
+            if waiting:
+
+                continue
+
+            next_check = None
+
+            if row["next_check_at"]:
+
+                next_check = datetime.fromisoformat(
+                    row["next_check_at"]
+                )
+
+            if (
+                not next_check
+                or now >= next_check
+            ):
+
+                await self.prompt_sleep_check(
+                    row,
+                    member,
+                    now
+                )
+
+    async def prompt_sleep_check(
+        self,
+        row,
+        member,
+        now
+    ):
+
+        from apibot import SleepCheckView
+
+        waiting = (
+            now
+            +
+            timedelta(
+                minutes=
+                row[
+                    "response_minutes"
+                ]
+            )
         )
 
         try:
-            view = ScheduleReminderView(
-                self.bot,
-                schedule,
-                execution,
+
+            await member.send(
+                (
+                    "😴 **¿Sigues despierto?**\n\n"
+                    "Si sigues aquí, confirma.\n"
+                    "Si no respondes, Bot94 Sleep "
+                    "te silenciará."
+                ),
+                view=SleepCheckView(
+                    self.bot,
+                    member.id,
+                    member.guild.id
+                )
             )
-            message = await member.send(text, view=view)
-            view.message = message
+
+            update_sleep_check(
+                member.id,
+                member.guild.id,
+                waiting_until=waiting.isoformat(
+                    timespec="seconds"
+                ),
+                last_prompt_at=now.isoformat(
+                    timespec="seconds"
+                ),
+                next_check_at=(
+                    now
+                    +
+                    timedelta(
+                        minutes=
+                        row[
+                            "interval_minutes"
+                        ]
+                    )
+                ).isoformat(
+                    timespec="seconds"
+                )
+            )
 
         except discord.Forbidden:
-            logger.warning(
-                "No se pudo enviar DM de recordatorio a %s.",
-                member,
+
+            log.warning(
+                "No pude enviar Sleep Check a %s",
+                member.id
             )
-        except Exception:
-            logger.exception(
-                "Error enviando recordatorio del schedule %s.",
-                schedule["id"],
-            )
-
-    async def execute_scheduled(self, execution):
-        guild = self.bot.get_guild(execution["guild_id"])
-
-        if guild is None:
-            return
-
-        member = guild.get_member(execution["user_id"])
-
-        if (
-            member is None
-            or member.voice is None
-            or member.voice.channel is None
-        ):
-            logger.info(
-                "Schedule %s: el usuario no está en voz; "
-                "no se ejecuta.",
-                execution["schedule_id"],
-            )
-            update_execution(
-                execution["id"],
-                status="skipped",
-                executed=1,
-                updated_at=datetime.now(TIMEZONE).isoformat(),
-            )
-            return
-
-        result = await execute_actions(
-            member,
-            mute=execution["mute"],
-            deafen=execution["deafen"],
-            disconnect=execution["disconnect"],
-        )
-
-        update_execution(
-            execution["id"],
-            status="executed" if result else "failed",
-            executed=1,
-            updated_at=datetime.now(TIMEZONE).isoformat(),
-        )
-
-
-def format_actions(row):
-    mute, deafen, disconnect = normalize_actions(
-        row["mute"],
-        row["deafen"],
-        row["disconnect"],
-    )
-
-    actions = []
-
-    if mute:
-        actions.append("🔇 Mute")
-    if deafen:
-        actions.append("🎧 Deafen")
-    if disconnect:
-        actions.append("🚪 Disconnect")
-
-    return "\n".join(actions) or "⚠️ Sin acciones"

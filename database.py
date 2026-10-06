@@ -1,66 +1,139 @@
+import json
 import sqlite3
-from pathlib import Path
 
-DATABASE_FILE = Path("bot94_sleep.db")
+from contextlib import contextmanager
+from datetime import datetime
+
+from config import DATABASE_FILE, TIMEZONE
 
 
-def get_connection():
-    connection = sqlite3.connect(DATABASE_FILE)
+def now_iso():
+    return datetime.now(
+        TIMEZONE
+    ).isoformat(timespec="seconds")
+
+
+@contextmanager
+def db():
+
+    connection = sqlite3.connect(
+        DATABASE_FILE
+    )
+
     connection.row_factory = sqlite3.Row
-    return connection
+
+    try:
+        yield connection
+        connection.commit()
+
+    finally:
+        connection.close()
 
 
-def _column_names(connection, table_name):
-    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {row["name"] for row in rows}
+def init_db():
+
+    with db() as connection:
+
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+
+                time TEXT NOT NULL,
+                days TEXT NOT NULL,
+
+                mute INTEGER NOT NULL DEFAULT 0,
+                deafen INTEGER NOT NULL DEFAULT 0,
+                disconnect INTEGER NOT NULL DEFAULT 1,
+
+                confirmation INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 1,
+
+                created_at TEXT NOT NULL
+            );
 
 
-def init_database():
-    connection = get_connection()
+            CREATE TABLE IF NOT EXISTS schedule_executions (
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS schedules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            guild_id INTEGER NOT NULL,
-            time TEXT NOT NULL,
-            days TEXT NOT NULL,
-            mute INTEGER NOT NULL DEFAULT 0,
-            deafen INTEGER NOT NULL DEFAULT 0,
-            disconnect INTEGER NOT NULL DEFAULT 0,
-            confirmation INTEGER NOT NULL DEFAULT 1,
-            enabled INTEGER NOT NULL DEFAULT 1
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                schedule_id INTEGER NOT NULL,
+
+                execution_date TEXT NOT NULL,
+
+                original_datetime TEXT NOT NULL,
+
+                override_datetime TEXT,
+
+                status TEXT NOT NULL DEFAULT 'pending',
+
+                reminder_sent INTEGER NOT NULL DEFAULT 0,
+
+                confirmed INTEGER NOT NULL DEFAULT 0,
+
+                created_at TEXT NOT NULL,
+
+                updated_at TEXT NOT NULL,
+
+                UNIQUE(
+                    schedule_id,
+                    execution_date
+                )
+            );
+
+
+            CREATE TABLE IF NOT EXISTS sleep_checks (
+
+                user_id INTEGER NOT NULL,
+
+                guild_id INTEGER NOT NULL,
+
+                enabled INTEGER NOT NULL DEFAULT 0,
+
+                interval_minutes INTEGER NOT NULL DEFAULT 15,
+
+                response_minutes INTEGER NOT NULL DEFAULT 2,
+
+                next_check_at TEXT,
+
+                waiting_until TEXT,
+
+                last_prompt_at TEXT,
+
+                muted_by_sleep_check INTEGER NOT NULL DEFAULT 0,
+
+                PRIMARY KEY (
+                    user_id,
+                    guild_id
+                )
+            );
+
+
+            CREATE TABLE IF NOT EXISTS voice_effects (
+
+                user_id INTEGER NOT NULL,
+
+                guild_id INTEGER NOT NULL,
+
+                mute_by_bot INTEGER NOT NULL DEFAULT 0,
+
+                deafen_by_bot INTEGER NOT NULL DEFAULT 0,
+
+                updated_at TEXT NOT NULL,
+
+                PRIMARY KEY (
+                    user_id,
+                    guild_id
+                )
+            );
+            """
         )
-    """)
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS schedule_executions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            schedule_id INTEGER NOT NULL,
-            execution_date TEXT NOT NULL,
-            original_time TEXT NOT NULL,
-            override_time TEXT,
-            override_datetime TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            reminder_sent INTEGER NOT NULL DEFAULT 0,
-            confirmed INTEGER NOT NULL DEFAULT 0,
-            executed INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(schedule_id, execution_date),
-            FOREIGN KEY(schedule_id) REFERENCES schedules(id) ON DELETE CASCADE
-        )
-    """)
 
-    # Compatibility with the previous v1.2 database.
-    columns = _column_names(connection, "schedule_executions")
-    if "override_datetime" not in columns:
-        connection.execute(
-            "ALTER TABLE schedule_executions ADD COLUMN override_datetime TEXT"
-        )
-
-    connection.commit()
-    connection.close()
+init_db()
 
 
 def create_schedule(
@@ -71,196 +144,586 @@ def create_schedule(
     mute,
     deafen,
     disconnect,
-    confirmation,
+    confirmation
 ):
-    connection = get_connection()
-    cursor = connection.execute(
-        """
-        INSERT INTO schedules
-        (user_id, guild_id, time, days, mute, deafen, disconnect, confirmation, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-        """,
-        (
-            user_id,
-            guild_id,
-            time,
-            days,
-            int(bool(mute)),
-            int(bool(deafen)),
-            int(bool(disconnect)),
-            int(bool(confirmation)),
-        ),
+
+    mute = bool(
+        mute or deafen
     )
-    connection.commit()
-    schedule_id = cursor.lastrowid
-    connection.close()
-    return schedule_id
+
+    with db() as connection:
+
+        cursor = connection.execute(
+            """
+            INSERT INTO schedules
+            (
+                user_id,
+                guild_id,
+                time,
+                days,
+                mute,
+                deafen,
+                disconnect,
+                confirmation,
+                enabled,
+                created_at
+            )
+
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+
+            (
+                int(user_id),
+                int(guild_id),
+                time,
+                json.dumps(
+                    days,
+                    ensure_ascii=False
+                ),
+                int(mute),
+                int(deafen),
+                int(disconnect),
+                int(confirmation),
+                now_iso()
+            )
+        )
+
+        return cursor.lastrowid
 
 
-def get_schedules():
-    connection = get_connection()
-    rows = connection.execute(
-        "SELECT * FROM schedules WHERE enabled=1 ORDER BY id"
-    ).fetchall()
-    connection.close()
-    return rows
+def get_schedules(
+    user_id=None,
+    guild_id=None,
+    enabled_only=False
+):
+
+    query = """
+        SELECT *
+        FROM schedules
+        WHERE 1=1
+    """
+
+    parameters = []
+
+    if user_id is not None:
+
+        query += """
+            AND user_id = ?
+        """
+
+        parameters.append(
+            int(user_id)
+        )
+
+    if guild_id is not None:
+
+        query += """
+            AND guild_id = ?
+        """
+
+        parameters.append(
+            int(guild_id)
+        )
+
+    if enabled_only:
+
+        query += """
+            AND enabled = 1
+        """
+
+    query += """
+        ORDER BY time, id
+    """
+
+    with db() as connection:
+
+        return list(
+            connection.execute(
+                query,
+                parameters
+            ).fetchall()
+        )
 
 
-def get_user_schedules(user_id):
-    connection = get_connection()
-    rows = connection.execute(
-        "SELECT * FROM schedules WHERE user_id=? ORDER BY time, id",
-        (user_id,),
-    ).fetchall()
-    connection.close()
-    return rows
+def get_schedule(schedule_id):
+
+    with db() as connection:
+
+        return connection.execute(
+            """
+            SELECT *
+            FROM schedules
+            WHERE id = ?
+            """,
+            (int(schedule_id),)
+        ).fetchone()
 
 
 def update_schedule(
     schedule_id,
-    user_id,
-    time,
-    days,
-    mute,
-    deafen,
-    disconnect,
-    confirmation,
+    **fields
 ):
-    connection = get_connection()
-    cursor = connection.execute(
-        """
-        UPDATE schedules
-        SET time=?, days=?, mute=?, deafen=?, disconnect=?, confirmation=?
-        WHERE id=? AND user_id=?
-        """,
-        (
-            time,
-            days,
-            int(bool(mute)),
-            int(bool(deafen)),
-            int(bool(disconnect)),
-            int(bool(confirmation)),
-            schedule_id,
-            user_id,
-        ),
-    )
-    connection.commit()
-    changed = cursor.rowcount > 0
-    connection.close()
-    return changed
 
-
-def set_schedule_enabled(schedule_id, user_id, enabled):
-    connection = get_connection()
-    cursor = connection.execute(
-        "UPDATE schedules SET enabled=? WHERE id=? AND user_id=?",
-        (int(bool(enabled)), schedule_id, user_id),
-    )
-    connection.commit()
-    changed = cursor.rowcount > 0
-    connection.close()
-    return changed
-
-
-def delete_schedule(schedule_id, user_id):
-    connection = get_connection()
-    cursor = connection.execute(
-        "DELETE FROM schedules WHERE id=? AND user_id=?",
-        (schedule_id, user_id),
-    )
-    connection.commit()
-    deleted = cursor.rowcount > 0
-    connection.close()
-    return deleted
-
-
-def get_execution(schedule_id, execution_date):
-    connection = get_connection()
-    row = connection.execute(
-        """
-        SELECT * FROM schedule_executions
-        WHERE schedule_id=? AND execution_date=?
-        """,
-        (schedule_id, execution_date),
-    ).fetchone()
-    connection.close()
-    return row
-
-
-def get_execution_by_id(execution_id):
-    connection = get_connection()
-    row = connection.execute(
-        """
-        SELECT e.*, s.user_id, s.guild_id, s.time, s.days,
-               s.mute, s.deafen, s.disconnect, s.confirmation, s.enabled
-        FROM schedule_executions e
-        JOIN schedules s ON s.id=e.schedule_id
-        WHERE e.id=?
-        """,
-        (execution_id,),
-    ).fetchone()
-    connection.close()
-    return row
-
-
-def create_execution(schedule_id, execution_date, original_time, created_at):
-    connection = get_connection()
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO schedule_executions
-        (schedule_id, execution_date, original_time, status,
-         reminder_sent, confirmed, executed, created_at, updated_at)
-        VALUES (?, ?, ?, 'pending', 0, 0, 0, ?, ?)
-        """,
-        (schedule_id, execution_date, original_time, created_at, created_at),
-    )
-    connection.commit()
-    connection.close()
-    return get_execution(schedule_id, execution_date)
-
-
-def update_execution(execution_id, **fields):
     allowed = {
-        "override_time",
+        "time",
+        "days",
+        "mute",
+        "deafen",
+        "disconnect",
+        "confirmation",
+        "enabled"
+    }
+
+    fields = {
+        key: value
+        for key, value in fields.items()
+        if key in allowed
+    }
+
+    if "deafen" in fields and fields["deafen"]:
+
+        fields["mute"] = 1
+
+    if (
+        "days" in fields
+        and isinstance(fields["days"], list)
+    ):
+
+        fields["days"] = json.dumps(
+            fields["days"],
+            ensure_ascii=False
+        )
+
+    for key in (
+        "mute",
+        "deafen",
+        "disconnect",
+        "confirmation",
+        "enabled"
+    ):
+
+        if key in fields:
+
+            fields[key] = int(
+                bool(fields[key])
+            )
+
+    if not fields:
+
+        return False
+
+    with db() as connection:
+
+        cursor = connection.execute(
+            "UPDATE schedules SET "
+            +
+            ",".join(
+                f"{key} = ?"
+                for key in fields
+            )
+            +
+            " WHERE id = ?",
+
+            list(fields.values())
+            +
+            [int(schedule_id)]
+        )
+
+        return cursor.rowcount > 0
+
+
+def delete_schedule(schedule_id):
+
+    with db() as connection:
+
+        connection.execute(
+            """
+            DELETE FROM schedule_executions
+            WHERE schedule_id = ?
+            """,
+            (int(schedule_id),)
+        )
+
+        cursor = connection.execute(
+            """
+            DELETE FROM schedules
+            WHERE id = ?
+            """,
+            (int(schedule_id),)
+        )
+
+        return cursor.rowcount > 0
+
+
+def get_execution(
+    schedule_id,
+    execution_date
+):
+
+    with db() as connection:
+
+        return connection.execute(
+            """
+            SELECT *
+            FROM schedule_executions
+
+            WHERE schedule_id = ?
+            AND execution_date = ?
+            """,
+
+            (
+                int(schedule_id),
+                execution_date
+            )
+        ).fetchone()
+
+
+def create_execution(
+    schedule_id,
+    execution_date,
+    original_datetime
+):
+
+    current = now_iso()
+
+    with db() as connection:
+
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO schedule_executions
+            (
+                schedule_id,
+                execution_date,
+                original_datetime,
+                created_at,
+                updated_at
+            )
+
+            VALUES (?, ?, ?, ?, ?)
+            """,
+
+            (
+                int(schedule_id),
+                execution_date,
+                original_datetime,
+                current,
+                current
+            )
+        )
+
+        return get_execution(
+            schedule_id,
+            execution_date
+        )
+
+
+def update_execution(
+    execution_id,
+    **fields
+):
+
+    allowed = {
         "override_datetime",
         "status",
         "reminder_sent",
-        "confirmed",
-        "executed",
-        "updated_at",
+        "confirmed"
     }
+
     fields = {
-        key: value for key, value in fields.items() if key in allowed
+        key: value
+        for key, value in fields.items()
+        if key in allowed
     }
+
     if not fields:
+
         return False
 
-    assignments = ", ".join(f"{key}=?" for key in fields)
-    values = list(fields.values())
-    values.append(execution_id)
+    fields["updated_at"] = now_iso()
 
-    connection = get_connection()
-    cursor = connection.execute(
-        f"UPDATE schedule_executions SET {assignments} WHERE id=?",
-        values,
+    with db() as connection:
+
+        cursor = connection.execute(
+            "UPDATE schedule_executions SET "
+            +
+            ",".join(
+                f"{key} = ?"
+                for key in fields
+            )
+            +
+            " WHERE id = ?",
+
+            list(fields.values())
+            +
+            [int(execution_id)]
+        )
+
+        return cursor.rowcount > 0
+
+
+def get_enabled_sleep_checks():
+
+    with db() as connection:
+
+        return list(
+            connection.execute(
+                """
+                SELECT *
+                FROM sleep_checks
+                WHERE enabled = 1
+                """
+            ).fetchall()
+        )
+
+
+def get_sleep_check(
+    user_id,
+    guild_id
+):
+
+    with db() as connection:
+
+        return connection.execute(
+            """
+            SELECT *
+            FROM sleep_checks
+
+            WHERE user_id = ?
+            AND guild_id = ?
+            """,
+
+            (
+                int(user_id),
+                int(guild_id)
+            )
+        ).fetchone()
+
+
+def set_sleep_check(
+    user_id,
+    guild_id,
+    enabled,
+    interval_minutes,
+    response_minutes,
+    next_check_at
+):
+
+    with db() as connection:
+
+        connection.execute(
+            """
+            INSERT INTO sleep_checks
+            (
+                user_id,
+                guild_id,
+                enabled,
+                interval_minutes,
+                response_minutes,
+                next_check_at,
+                waiting_until,
+                last_prompt_at,
+                muted_by_sleep_check
+            )
+
+            VALUES (
+                ?, ?, ?, ?, ?, ?, NULL, NULL, 0
+            )
+
+            ON CONFLICT(
+                user_id,
+                guild_id
+            )
+
+            DO UPDATE SET
+
+                enabled =
+                    excluded.enabled,
+
+                interval_minutes =
+                    excluded.interval_minutes,
+
+                response_minutes =
+                    excluded.response_minutes,
+
+                next_check_at =
+                    excluded.next_check_at,
+
+                waiting_until =
+                    NULL,
+
+                last_prompt_at =
+                    NULL
+            """,
+
+            (
+                int(user_id),
+                int(guild_id),
+                int(enabled),
+                int(interval_minutes),
+                int(response_minutes),
+                next_check_at
+            )
+        )
+
+
+def update_sleep_check(
+    user_id,
+    guild_id,
+    **fields
+):
+
+    allowed = {
+        "enabled",
+        "interval_minutes",
+        "response_minutes",
+        "next_check_at",
+        "waiting_until",
+        "last_prompt_at",
+        "muted_by_sleep_check"
+    }
+
+    fields = {
+        key: value
+        for key, value in fields.items()
+        if key in allowed
+    }
+
+    if not fields:
+
+        return False
+
+    with db() as connection:
+
+        cursor = connection.execute(
+            "UPDATE sleep_checks SET "
+            +
+            ",".join(
+                f"{key} = ?"
+                for key in fields
+            )
+            +
+            """
+            WHERE user_id = ?
+            AND guild_id = ?
+            """,
+
+            list(fields.values())
+            +
+            [
+                int(user_id),
+                int(guild_id)
+            ]
+        )
+
+        return cursor.rowcount > 0
+
+
+def upsert_voice_effect(
+    user_id,
+    guild_id,
+    mute_by_bot=None,
+    deafen_by_bot=None
+):
+
+    old = get_voice_effect(
+        user_id,
+        guild_id
     )
-    connection.commit()
-    changed = cursor.rowcount > 0
-    connection.close()
-    return changed
+
+    mute = (
+        old["mute_by_bot"]
+        if old and mute_by_bot is None
+        else int(bool(mute_by_bot))
+    )
+
+    deafen = (
+        old["deafen_by_bot"]
+        if old and deafen_by_bot is None
+        else int(bool(deafen_by_bot))
+    )
+
+    with db() as connection:
+
+        connection.execute(
+            """
+            INSERT INTO voice_effects
+            (
+                user_id,
+                guild_id,
+                mute_by_bot,
+                deafen_by_bot,
+                updated_at
+            )
+
+            VALUES (?, ?, ?, ?, ?)
+
+            ON CONFLICT(
+                user_id,
+                guild_id
+            )
+
+            DO UPDATE SET
+
+                mute_by_bot =
+                    excluded.mute_by_bot,
+
+                deafen_by_bot =
+                    excluded.deafen_by_bot,
+
+                updated_at =
+                    excluded.updated_at
+            """,
+
+            (
+                int(user_id),
+                int(guild_id),
+                mute,
+                deafen,
+                now_iso()
+            )
+        )
 
 
-def get_pending_executions():
-    connection = get_connection()
-    rows = connection.execute(
-        """
-        SELECT e.*, s.user_id, s.guild_id, s.time, s.days,
-               s.mute, s.deafen, s.disconnect, s.confirmation, s.enabled
-        FROM schedule_executions e
-        JOIN schedules s ON s.id=e.schedule_id
-        WHERE e.status='pending' AND e.executed=0 AND s.enabled=1
-        ORDER BY e.execution_date, e.id
-        """
-    ).fetchall()
-    connection.close()
-    return rows
+def get_voice_effect(
+    user_id,
+    guild_id
+):
+
+    with db() as connection:
+
+        return connection.execute(
+            """
+            SELECT *
+            FROM voice_effects
+
+            WHERE user_id = ?
+            AND guild_id = ?
+            """,
+
+            (
+                int(user_id),
+                int(guild_id)
+            )
+        ).fetchone()
+
+
+def clear_voice_effect(
+    user_id,
+    guild_id
+):
+
+    with db() as connection:
+
+        connection.execute(
+            """
+            DELETE FROM voice_effects
+
+            WHERE user_id = ?
+            AND guild_id = ?
+            """,
+
+            (
+                int(user_id),
+                int(guild_id)
+            )
+        )
